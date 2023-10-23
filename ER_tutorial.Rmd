@@ -1,0 +1,565 @@
+---
+title: "Tutorial on differential ChIP-Seq analysis using the DiffBind package"
+author: "Christiane Böckel, Xavier Pastor, Matthias Heinig and Thomas Walzthoeni"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+    code_folding: show
+---
+
+```{r setup, include = TRUE, echo = FALSE, message=FALSE, warning=FALSE}
+library(here)
+knitr::opts_knit$set(root.dir = here(), echo = TRUE, include = TRUE)
+library(DT)
+```
+
+# Preamble {.unlisted .unnumbered}
+This tutorial is complementary to the article *"Differential analysis of protein-DNA binding using ChIP-Seq data"*, Chromatin Immunoprecipitation: Methods and Protocols, Springer book series [Methods in Molecular Biology](https://www.springer.com/series/7651)
+
+# Required packages
+Please note, this report has been generated with R version 4.2.2 and RStudio version 2023.03.1 Build 446.
+Once R and Rstudio is installed, all required R packages can be installed by running the [00_install_packages.R](./00_install_packages.R) script.  
+
+Required packages:  
+- DiffBind=3.8.4  
+- dplyr  
+- DESeq2  
+- edgeR  
+- Rsamtools  
+- rGREAT  
+- BSgenome.Hsapiens.UCSC.hg38  
+- bibtex  
+
+# Data
+In this tutorial we work with the [DiffBind package](https://bioconductor.org/packages/release/bioc/html/DiffBind.html) in order to perform a differential ChIP-Seq analysis.
+We will re-analyze the ChIP-Seq dataset from [GSE32222](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE32222) of the transcription factor Estrogen Receptor alpha (ERa). The cancer cells have been treated with tamoxifen, to which some cell lines responded while others were resistant.
+`DiffBind` is used to detect the differences in ERa binding between responding and non-responding cells.
+This dataset is provided by the authors of the Diffbind package and will be automatically downloaded to the current working directory by running this RMarkdown script.
+The dataset consists of preprocessed reads that were aligned to the human genome (hg38). 
+Alignment files (BAM files) and BED files of the peaks which were called with MACS2 were restricted to only contain data from Chromosome 18.
+
+# Data download
+
+In this step the data required for the analysis is downloaded.  
+
+```{r load_packages, message=FALSE, echo=TRUE, class.source = 'fold-hide'}
+# Load required packages
+library(DiffBind)
+library(dplyr)
+if ( !dir.exists(file.path(here("DiffBind_vignette"))) ){
+print("Downloading DiffBind dataset")
+# Download the data
+url <- 'https://content.cruk.cam.ac.uk/bioinformatics/software/DiffBind/DiffBind_vignette_data.tar.gz'
+file <- basename(url)
+options(timeout=600)
+download.file(url, file.path(here(),file))
+untar(file.path(here(),file), exdir = here() )
+unlink(here(file))
+}else{
+print("Downloading DiffBind dataset skipped since folder already exists")
+}
+```
+## Import data
+`DiffBind` can read in data with the `dba()` function from a comma-separated sample sheet, Excel spreadsheet or dataframe. The sample sheet contains metadata about the samples such as the unique sample ID, the differential condition as well as the file locations for the alignment files (BAM files) and peak files (BED files). For the full list of potential column names please refer to the help page for the `dba()` function. The sample sheet for the analysis is provided in the file `DiffBind_vignette/tamoxifen.csv` and is loaded and shown below (Table 1).
+
+```{r data, message = FALSE, warning=FALSE, class.source = 'fold-hide'}
+# Read CSV file with sample data
+samples <- read.csv(here("DiffBind_vignette","tamoxifen.csv"))
+samples$bamReads = paste0("DiffBind_vignette/",samples$bamReads)
+samples$bamControl = paste0("DiffBind_vignette/",samples$bamControl)
+samples$Peaks = paste0("DiffBind_vignette/",samples$Peaks)
+
+# show table
+datatable(samples, options = list(autoWidth = TRUE, scrollX = TRUE), caption = htmltools::tags$caption(
+    style = 'caption-side: top; text-align: left;',
+    'Table 1: ', htmltools::em('sample table')))
+```
+
+`DiffBind` works with package-specific `DBA` objects which contain both, the data and the metadata.  
+The initial dba object here named `tamoxifen` can be created with: `tamoxifen <- dba(sampleSheet = samples)`  
+The DBA object will be stored at the end of the report, if it is already present in the working directory it will load the stored object and not rerun the analysis.
+```{r dba_object, message=FALSE, echo=TRUE, class.source = 'fold-hide'}
+# Check if the dba file already exists, will be saved at the end of the analysis
+if(file.exists(here("ER_analysis_dba.RData"))){
+  print('Tamoxifen dba object already exists in the current folder and will be loaded. If you want to recompute the analysis please remove the file ER_analysis_dba.RData')
+  tamoxifen <- dba.load("ER_analysis_dba", pre='')
+    tamoxifen_print = dba(sampleSheet = samples)
+} else {
+  print('Tamoxifen dba object does not exists, will create new dba object from the sample table.')
+  tamoxifen <- dba(sampleSheet = samples)
+  tamoxifen_print = tamoxifen
+}
+```
+When you print the object with `print()`, you will see the metadata and the number of peaks per sample (Interval column) as well as the number of unique peaks (see Table 2).
+
+```{r dba_object_show, class.source = 'fold-hide'}
+#print(tamoxifen_print)
+cat(sprintf("%s:\n",summary(tamoxifen_print)))
+datatable(dba.show(tamoxifen_print), options = list(autoWidth = TRUE, scrollX = TRUE, pageLength=15), caption = htmltools::tags$caption(
+    style = 'caption-side: top; text-align: left;',
+    'Table 2: ', htmltools::em('Summary table of dba object.')))
+```
+
+## Blacklist regions
+
+ChIP-Seq can be impaired by nonspecific binding, repetitive regions and regions with high protein content (e.g. promoters) that can give rise to false positive signals.
+It is recommended to exclude these regions and to that end the ENCODE consortium has compiled so called blacklists.  
+
+`DiffBind` allows to remove peaks from the analysis using the `dba.blacklist()` function.  
+In order to run it correctly, the genome version in the `blacklist` option can be specified and needs to match the genome version that was used for the data pre-processing.  
+For the list of available blacklists please refer to the help page of the function by using `?dba.blacklist()` on the R console.  
+Furthermore, it is possible to specify a custom blacklist in form of a GRanges object.  
+
+In addition to blacklists also so-called greylists can be used. Greylists are experiment specific and can be generated from the mock or inputs samples.
+In this tutorial to speedup the analysis, we omit this step and set the `greylist` option to FALSE.
+
+```{r blacklist, collapse=T, class.source = 'fold-hide'}
+tamoxifen <- dba.blacklist(tamoxifen, blacklist = DBA_BLACKLIST_HG38, greylist = FALSE)
+```
+## Counts
+
+Until now, the dba object contains the peak positions but it does not yet contain information about the number of reads within each peak.  
+To quantify the same regions across all samples, a so called consensus peak set is created using the `dba.count()` function:
+To create this consensus peak set the following steps are carried out:  
+
+1. Peaks which overlap in at least 2 samples are merged and considered as candidate consensus peaks
+2. For these candidate consensus peaks the summits are recalculated by finding the maximum value of a pileup of the reads over all samples
+3. In order to standardize the consensus peaks for the subsequent analysis, a region is created spanning n bases up and downstream of the summit (default argument is `summits = 200` bp).
+4. For each sample and consensus peak the read counts are obtained
+
+```{r counts, warning=F, collapse = TRUE, class.source = 'fold-hide'}
+tamoxifen <- dba.count(tamoxifen)
+```
+In addition to the metadata, the printed dba object now lists the number of aligned reads within each sample (`Reads`, see Table 3). This is also referred to as library size. Furthermore, the FRiP score is given which is the **F**raction of **R**eads **i**n **P**eaks and is a measure of signal-to-noise ratio.
+The [ENCODE project guideline](https://www.encodeproject.org/data-standards/) recommend FRiP scores > 1% in order to pass the quality requirements.  
+
+```{r countstab, class.source = 'fold-hide'}
+# print table
+datatable(dba.show(tamoxifen), options = list(autoWidth = TRUE, scrollX = TRUE, pageLength=15), caption = htmltools::tags$caption(
+    style = 'caption-side: top; text-align: left;',
+    'Table 3: ', htmltools::em('Summary table of dba object with FRiP score')))
+
+```
+
+# Quality checks and sample visualization  
+
+After deriving the count matrix of consensus peaks over all samples, we can now visualize the samples using low dimensional representations.
+To that end, DiffBind provides functions to create correlation based heatmaps and PCA plots.
+Both plots can be used to visualize the samples and it is expected that replicates of the same samples and conditions are more similar to each other than to those of different conditions.
+
+## PCA plot
+
+The PCA plot in Figure 1 shows that the samples group by cell type, whereby PC1 and PC2 explain 41% and 20% of the variance respectively.
+
+```{r PCA_all, fig.cap="Figure 1: PCA plot", fig.height=6, echo=TRUE, message=FALSE, class.source = 'fold-hide'}
+# PCA
+pc=DiffBind:::pv.pcmask(tamoxifen)
+
+# Get plotdata PC1, PC2
+plotData <- as.data.frame(pc$pc$x[,c("PC1","PC2")])
+# Var
+vr <- rep(0,length(pc$pc$sdev))
+for (i in 1:length(vr)) {
+vr[i] <- pc$pc$sdev[i] ^ 2
+}
+
+# Var explained
+c1p <- vr[1] / sum(vr) * 100
+c2p <- vr[2] / sum(vr) * 100
+
+# Add condition
+plotData$Condition = tamoxifen$samples[match(rownames(plotData), tamoxifen$samples$SampleID),"Condition"]
+
+# Add tissue
+plotData$Tissue = tamoxifen$samples[match(rownames(plotData), tamoxifen$samples$SampleID),"Tissue"]
+
+# plotlabs
+xlab=sprintf('PC #%d [%2.0f%%]',1,c1p)
+ylab=sprintf('PC #%d [%2.0f%%]',2,c2p)
+title="PCA plot of samples"
+
+# Change point shapes and colors
+library(ggplot2)
+pl=ggplot(plotData, aes(x=PC1, y=PC2, shape=Condition, color=Tissue)) +
+  geom_point(size=2.5) +
+  theme_minimal() + ggtitle(title) +
+  xlab(xlab) + ylab(ylab) + scale_color_brewer(palette="Dark2")
+print(pl)
+# Save
+dir.create(here("results", "plots"), showWarnings = FALSE, recursive = TRUE)
+setEPS()
+postscript(here("results", "plots", "Fig1.eps"), height=5, width=6.5)
+print(pl)
+invisible(capture.output(dev.off()))
+```
+
+## Heatmap
+
+If you plot a dba object with the in-built plot function, you will automatically get a correlation heatmap with a dendrogram of hierarchical clustering along both axes (see Figure 2). 
+In case of the current dba object, the correlation coefficient matrix is calculated based on the number of reads within the consensus peaks for each sample. 
+Both, the heatmap and the dendrogram of the clustering shows a similar result as the PCA plot. The samples are much more similar among the same cell type (Tissue) but cannot be differentiated by responsiveness (Condition).
+
+```{r plot_heatmap_affinity, fig.height=8, fig.cap="Figure 2: Correlation heatmap", class.source = 'fold-hide'}
+# dir.create(here("results/plots"),showWarnings = F)
+setEPS()
+postscript(here("results/plots/Fig2.eps"))
+plot(tamoxifen)
+invisible(capture.output(dev.off())) 
+plot(tamoxifen)
+```
+
+## Normalization
+
+One important step in differential peak analysis is normalization. We need to normalize our data because it contains noise and technical biases on top of actual biological signal. We do not know which of our data is noise or bias, therefore, we need to consider various normalization strategies to select a proper one, which does not remove or alter actual biological effects.
+
+### Sample normalization methods
+
+`DiffBind` has three different sample normalization methods. One is native to `DESeq2`, another one to `edgeR` (both are differential analysis packages for RNA-Seq data) and the third one is a simple method, which normalizes by library size.
+It has to be noted here that `DESeq2` and `edgeR` are designed for RNA-Seq data, which fulfills different assumptions than we would expect for most ChIP-Seq data. In RNA-Seq, for example, we assume that most of the genes are not differentially expressed and that they have the same basal expression across samples. The influence of differentially expressed genes to the normalization are negligible since it is assumed that the great majority of the genes are not differentially expressed. For ChIP-Seq data, however, this assumption might not be true. Due to the fact that we enrich for our regions of interest, we likely have big differences in reads numbers per peak across different samples. A normalization with `DESeq2` or `edgeR` should therefore be avoided if you expect a considerable difference between your conditions.
+
+- `"lib"`: makes all libraries equal size
+- `"RLE"`: native to [DESeq2](http://bioconductor.org/packages/release/bioc/html/DESeq2.html), calculates geometric mean for each peak across samples
+- `"TMM"`: native to [edgeR](http://bioconductor.org/packages/release/bioc/html/edgeR.html), calculates a trimmed mean of M-values 
+
+### Library size
+
+One technical bias that always influences our data is sequencing depth. Samples which were sequenced deeper will statistically have more reads within a peak than samples with a shallower sequencing depth. 
+When we normalize by library size, we can either normalize by all aligned reads, which would be the `full` set of reads or we could focus on the reads in peaks (`RiP`), which not only take into account the sequencing depth but also the ChIP efficiency. 
+Normalizing by full library size is a safe choice for normalization because we do not make any assumptions about our data such as that the majority of the peaks are not different across samples (as would be expected for RNA-Seq data). Therefore, we do not risk to accidentally remove true biological signal with this method. Normalization by reads in peaks, on the other hand, is only an option if you expect to see no differences between the conditions for the majority of your peaks. In this case, however, a RLE or TMM normalization may be a better choice.
+
+- `"full"`: uses all aligned reads; no assumptions made
+- `"RiP"`: uses only reads aligned to consensus peakset; takes into account sequencing depth and ChIP efficiency
+
+### Background normalization
+
+Instead of focusing on the reads in peaks, as is done for the native normalization techniques of DESeq2 and edgeR, one could also normalize for differences across the background. The background signal is estimated based on large bins of the genome which should be large enough to stretch well over enriched regions. Therefore, the median signal at large intervals should represent background noise only. We expect that our ChIP-Seq enrichment occurs over narrow intervals of not more than 600 bp. Therefore, we set our background bin size to a considerable larger window of 10 kbp to estimate the median average background signal.
+This normalization has the benefit that the normalization factors will most likely not be influenced by imbalanced conditions. This normalization approach is based on an algorithm of [csaw](https://bioconductor.org/packages/release/bioc/html/csaw.html), a differential ChIP-Seq tool that does not rely on previously called peaks, but uses sliding windows. 
+
+### Normalization conclusion
+
+Selecting the correct normalization for your data is not trivial for ChIP-Seq data and often requires some experience as well as in-depth knowledge about the data. The safest option, which does not make assumptions about the data distribution, is doing a normalization by library size. This is also the default if you use `dba.normalize()` without setting additional parameters. Furthermore, applying the DESeq2 or edgeR normalization methods to background reads rather than the RiP, can be a good choice, as it has the benefit to remove technical biases in addition to differences in sequencing depth with a low risk to alter true biological differences between samples. 
+Please note that the background normalization depends on the usage of very large genomic bins, which are expected to have non-extreme median values. Therefore, this method is not appropriate for very broad chromatin profiles.
+
+### Example normalization
+
+In our case, we will apply the standard normalization (`normalize = lib`) with background normalization using the `dba.normalize` function. Here, we assume that a background window of at least 10.000 bases (`background = 10000`) will be large enough to even out peaks within that window when estimating sample specific background signals.
+
+```{r normalization, message=FALSE, class.source = 'fold-hide'}
+tamoxifen <- dba.normalize(tamoxifen, background = 10000, normalize = DBA_NORM_LIB)
+tamoxifen
+```
+
+
+## Defining contrasts
+
+In the next step, we need to supply `DiffBind` with information about the experimental design for it to work with the correct model for the data.
+A simple design would include two conditions, e.g. treatment and control, without considering any other factors that may have influenced the outcome. However, real experiments are often more complex than that. Due to the wide range of possible experimental designs, we will not discuss this topic in detail. Instead, we commend the following resources:
+The [DESeq2 vignette](http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#the-deseq2-model) explains in detail different experimental designs. If you are unsure which design applies to your experiment, you can also have a look at [this guide](https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/designmatrices.html), which gives instructions on how to create design matrices for gene expression experiments. This guide is written for another R package called `limma`, however, the design formulas you find there can also be used for the `dba.contrast()` function as shown below. If you are still uncertain about which design model is suitable for your experiment, you can also consult a statistician. 
+
+In case of our exemplary data set, we want to compare between the conditions 'resistant' and 'responsive'. To add these contrasts to our dba object, we use `dba.contrast()`. The additional parameter `reorderMeta=list(Condition='Responsive')` makes sure that we compare the resistant group to the responsive group. Therefore, all positive fold changes (FC) will represent an enrichment in the resistant group in comparison to the responsive group and negative FCs show decreased signal in the resistant group and an increase in the responsive group.
+
+```{r contrast, message = FALSE, class.source = 'fold-hide'}
+tamoxifen <- dba.contrast(tamoxifen, reorderMeta = list(Condition = "Responsive"), design = "~ Condition") 
+tamoxifen
+```
+
+
+## Differential peak analysis
+
+The actual differential analysis of `DiffBind` can be performed with `dba.analyze()`. Per default, the `DESeq2` method is used for for this. Optionally, you can also change this to `DBA_EDGER`to use the `edgeR` method or `DBA_ALL_METHODS` to perform two analyses with both methods. 
+DESeq2 uses a negative binomial distribution to model the data and estimates the distribution's parameters using a maximum likelihood estimation. Subsequently, a Wald test is performed to test for differential enrichment (this gives us the p-values). Lastly, a Benjamini-Hochberg procedure is used to control the false discovery rate (FDR) in multiple testing situations.
+
+```{r differential, message = FALSE, class.source = 'fold-hide'}
+tamoxifen <- dba.analyze(tamoxifen, method = DBA_DESEQ2, bBlacklist = DBA_BLACKLIST_GRCH38, bGreylist = FALSE)
+dba.show(tamoxifen, bContrasts = TRUE)
+```
+
+We can use `dba.show()` with `bContrasts = TRUE` to check that we have made the appropriate comparison. We can see that group 1 represents the condition that we are interested in, which is the resistant group and consists of 4 samples. Group 2 is the responsive condition, which consists of 7 samples and serves as a baseline. 'DB.DESeq2' shows the number of differential peaks, which were identified with the DESeq2 method. Usually, we would expect to find a lot more peaks (hundreds or thousands), however, this dataset includes only reads, which were aligned to chromosome 18 to reduce the computational effort in this example analysis.
+
+## Split analysis in multiple steps
+
+Please note that we can combine all the last steps in one piece of code in which the output of the previous function is piped into the next function. This way, you can apply all steps at once. However, if your new to `DiffBind`, we recommend to run the analysis step by step and investigate intermediate data to properly understand what each step is doing.
+
+```{r eval = FALSE}
+# This would be the whole analysis in one command
+tamoxifen <- dba(sampleSheet = here("DiffBind_Vignette", "tamoxifen.csv")) %>%
+  dba.blacklist(blacklist = DBA_BLACKLIST_HG38, greylist = FALSE) %>%
+  dba.count() %>%
+  dba.normalize(background = 10000, normalize = DBA_NORM_LIB) %>%
+  dba.contrast(reorderMeta = list(Condition = "Responsive"), design = "~ Condition")  %>%
+  dba.analyze(method = DBA_DESEQ2, bBlacklist = DBA_BLACKLIST_GRCH38, bGreylist = FALSE)
+```
+
+## Report the results
+
+We can export all the data of our differential peaks to a file by using `dba.report()`. It will generate a `GRanges` object that contains info about all our significant differential peaks. Per default, differential peaks are only filtered by FDR with this function. We recommend to apply an additional filter based on a minimum absolute fold change with the `fold` option (e.g `fold = 1`). `GRanges` objects behave similarly to data frames, therefore, we can use `write.csv()` to extract our data about differential binding in a comma separated file. To include all peak information, regardless of filtering based on log2 fold change and significance, use `dba.report()` with a threshold of 1 (`th = 1`).
+Additionally, you can export the positions of the differential peaks also in a bed format, which is often needed for certain downstream analyses. In order to get a bed file, we need to use the `export()` function of the `rtracklayer` package.
+
+```{r report_results, class.source = 'fold-hide'}
+tamoxifen.DB <- dba.report(tamoxifen, fold = 1)
+tamoxifen.DB
+
+dir.create(here("results"),showWarnings = F)
+write.csv(dba.report(tamoxifen, th = 1), here("results", "differential_binding.csv"), row.names = FALSE, quote = FALSE)
+
+library(rtracklayer)
+export(tamoxifen.DB, here("results", "differential_binding.bed"))
+```
+
+# Visualization of results
+
+DiffBind offers many easy-to-use functions to visualize results of the differential analysis. We will explain a selection of them, which are important to communicate the findings.
+
+## Volcano plots
+
+A very popular visualization strategy for differential data are volcano plots, which can be generated with `dba.plotVolcano()` (see Figure 3). They are simple scatter plots which show the log2 fold-change of the peaks on the x-axis and the negative decadent logarithm of the false discovery rate (FDR) on the y-axis. All dots in pink are significantly differentially enriched in one of the conditions. 
+
+```{r volcanofun, class.source = 'fold-hide'}
+# dba.plotVolcano(tamoxifen)
+
+## Plot function exported and adapted from diffbind package
+## see getAnywhere(dba.plotVolcano), getAnywhere(pv.DBAplotVolcano)
+plotVolcano=function (pv, contrast, method = "DESeq2", th = 0.05, bUsePval = FALSE, 
+    fold = 0, facname = "", bLabels = FALSE, maxLabels = 50, 
+    dotSize = 1, bSignificant = TRUE, bFlip = FALSE, xrange, 
+    yrange) 
+{
+    if (missing(contrast)) {
+        contrast <- 1:length(pv$contrasts)
+    }
+    else {
+        if (contrast > length(pv$contrasts)) {
+            stop("Specified contrast number is greater than number of contrasts", 
+                call. = FALSE)
+            return(NULL)
+        }
+    }
+    for (con in 1:length(contrast)) {
+        conrec <- pv$contrasts[[contrast[con]]]
+        name1 <- conrec$name1
+        name2 <- conrec$name2
+        if (bFlip) {
+            name1 <- conrec$name2
+            name2 <- conrec$name1
+        }
+        for (meth in method) {
+            res <- DiffBind:::pv.DBAreport(pv, contrast = contrast[con], 
+                method = meth, bUsePval = TRUE, th = 100, bNormalized = TRUE, 
+                bFlip = bFlip, precision = 0, lfc = fold)
+            if (!is.null(res)) {
+                if (bUsePval) {
+                  vals <- res$"p-value"
+                  idx <- vals <= th
+                  tstr <- "p"
+                  res = mutate(res, Legend = ifelse(res$"p-value" <= 
+                    th, sprintf(" p-val<=%1.2f", th), sprintf(" p-val >%1.2f", 
+                    th)))
+                }
+                else {
+                  vals <- res$FDR
+                  idx <- vals <= th
+                  tstr <- "FDR"
+                  res = mutate(res, Legend = ifelse(res$FDR < 
+                    th, sprintf(" FDR<=%1.2f", th), sprintf(" FDR >%1.2f", 
+                    th)))
+                }
+                res$Legend[idx & abs(res$Fold) < fold] <- sprintf("abs(Fold)<%1.2f", 
+                  2^fold)
+                idx <- idx & abs(res$Fold) >= fold
+                sigSites <- res[idx, ]
+                if (sum(idx) > 0) {
+                  rownames(sigSites) <- 1:sum(idx)
+                }
+                res <- cbind(0, res)
+                colnames(res)[1] <- "SiteNum"
+                if (sum(idx) > 0) {
+                  res[idx, 1] <- 1:sum(idx)
+                  sidx <- sum(idx)
+                }
+                else {
+                  sidx <- 0
+                }
+                constr <- DiffBind:::pv.getContrastString(conrec, bFlip)
+                plotTitle <- sprintf("%s Contrast: %s  [%s %s<=%1.3f", 
+                  facname, constr, sidx, tstr, th)
+                if (fold > 0) {
+                  plotTitle <- sprintf("%s & abs(Fold)>=%1.2f]", 
+                    plotTitle, 2^fold)
+                }
+                else {
+                  plotTitle <- sprintf("%s]", plotTitle)
+                }
+                xLabel <- "log2 Fold Change"
+                yLabel <- sprintf("-log10(%s)", tstr)
+                p <- ggplot(res, aes(Fold, -log10(vals))) + geom_point(aes(col = Legend), 
+                  size = dotSize) + scale_color_manual(values = c("#648FFF","#DC267F","gray"
+                  )) + labs(title = plotTitle, 
+                  x = xLabel, y = yLabel) + theme_minimal()
+                if (bLabels) {
+                  maxLabels <- min(sidx, maxLabels)
+                  if (maxLabels > 0 && sidx > 0) {
+                    xx <- which(idx)[1:maxLabels]
+                    p <- p + geom_text_repel(data = sigSites[1:maxLabels, 
+                      ], aes(x = Fold, y = -log10(vals[xx]), 
+                      label = rownames(sigSites)[1:maxLabels]))
+                  }
+                }
+                plot(p)
+            }
+        }
+    }
+    #if (sidx > 0) {
+    #    return(sigSites[, -10])
+    #}
+    #else {
+    #    return(NULL)
+    #}
+}
+```
+
+```{r volcano, fig.cap="Figure 3: Volcano plot", fig.height=6, class.source = 'fold-hide'}
+# save the plot
+setEPS()
+postscript(here("results", "plots", "Fig3.eps"), height=5, width=6.5)
+plotVolcano(tamoxifen)
+invisible(capture.output(dev.off()))
+# plot
+plotVolcano(tamoxifen)
+```
+
+We see in this volcano plot that we have more differential peaks in the resistant group than in the responders group. Hence, we can conclude that resistance to a tamoxifen treatment is accompanied with a reduction in binding sites.
+Volcano plots often also include lines that indicate the thresholds that were set to define significant peaks. Furthermore, extreme values may be labeled.
+
+### MA plots
+
+We can also visualize our results in a MA plot with the `dba.plotMA()`function (see Figure 4.1 and 4.2). MA plots are a common visualization method for differential data. It was originally designed for microarray data in which M-values were plotted against A-values, hence, the name of the plot. In our case, the x-axis represents the log concentration (A-value) of our peaks, also known as the mean normalized read number per peak. On the y-axis we can see the log2 fold-change (M-value) between our conditions. Each dot represents a peak. All peaks that are more enriched in the control group (in our case the responsive group) are plotted below the blue line in the middle. Peaks which are more enriched in the resistant group, are above the blue line. Significant differential peaks are marked in pink. Furthermore, we can see a blue cloud in the background which is a smoothed representation of our non-differential peaks. The darker the cloud, the more peaks can be found in that area of the plot. You can use the `bSmooth=FALSE` option to plot the actual non-differential peaks instead of using the smoothed representation.
+
+Moreover, you can see a red line within the plot. This is a fitted Loess curve, which shows local differences in mean values. Ideally, this line should be more or less straight. Deviations from this highlight local biases in our data that might need to be removed. Furthermore, if this red line is clearly above or below the blue line, our data is unbalanced and we have more differential binding in one of our conditions. Due to this property, we can use MA plots to make decisions about our normalization strategy. Note that you still need to apply `dba.contrast()` and `dba.analyze()` on the non-normalized data to make MA plots.
+
+```{r MA_plot1, fig.cap="Figure 4.1: MA plot with density cloud", class.source = 'fold-hide'}
+dba.plotMA(tamoxifen)
+```
+
+```{r MA_plot2, fig.cap="Figure 4.2: MA plot w/o density cloud", class.source = 'fold-hide'}
+dba.plotMA(tamoxifen, bSmooth = FALSE)
+```
+
+
+```{r MA_plotsave, fig.cap="Figure 4: MA plots", class.source = 'fold-hide'}
+# save the plots
+setEPS()
+postscript(here("results", "plots", "Fig4-1.eps"))
+dba.plotMA(tamoxifen)
+invisible(capture.output(dev.off()))
+
+setEPS()
+postscript(here("results", "plots", "Fig4-2.eps"))
+dba.plotMA(tamoxifen, bSmooth = FALSE)
+invisible(capture.output(dev.off()))
+```
+
+
+
+
+In our case, the MA plot looks balanced, however with more differential peaks showing negative log fold changes, indicating more reduced binding events in the resistant group.
+
+## Save the dba object
+
+Here, we save the dba object using the function `dba.save()` to the file `ER_analysis_dba.RData`.
+```{r savedba, include=FALSE, class.source = 'fold-hide'}
+dba.save(tamoxifen,file="./ER_analysis_dba", pre='')
+```
+
+# Downstream Analysis
+
+Now that we have identified differential peaks, we can ask more in-depth question about the functional background of these peaks. For example, transcription factors and certain histone modifications are linked to gene regulation and their ChIP-Seq peaks can be associated with the genes they may regulate. Furthermore, we can extract the sequences of the peaks and investigate them for the presence of recurring motifs. Furthermore, we can visualize BAM, BED or signal tracks from ChIP-Seq datasets in a genome browser.
+
+## Peak annotation: linking peaks to genes 
+
+Due to the fact that in these experiments, estrogen receptor alpha was immunoprecipitated, which acts like a transcription factor upon ligand binding, we can assume that our differential peaks are associated with gene regulation.
+A simple approach to connect differential peaks with its regulated genes is looking for overlaps of our peaks with promoters of known genes.
+
+We can use available libraries such as `TxDb.Hsapiens.UCSC.hg38.knownGene` to load annotated genome regions for our genome of interest, which is the homo sapiens genome hg38 from UCSC. This data is loaded as a `GRanges` object, which are the common data type for `GenomicRanges`. This package can handle and manipulate genomic annotations. A simple GRanges object consists of the genomic positions in specific format, which includes the sequence name, the start and the end position. Additional columns can be added, which provide the genomic positions with context (e.g. names, scores, …). We can extract genes from this dataset by using `genes()` and take windows around their TSS with `promoters()` to specify regions in which we expect to find the promoter. We use the `promoters()`function to extract the position of the transcriptional start sites (TSS). These are then used to define regulatory domains for each gene by creating basal windows 5000 bp upstream an 1000 bp downstream of the TSS. Furthermore, the regulatory domain will be extended to the basal regulatory domain of the next gene by maximum 1 Mbp. Eventually, we can use `findOverlaps()` with the GRanges object of our differential peaks and the defined regulatory domains. At this point, the genes are specified by a Entrez gene identifiers. To retrieve the respective gene symbols for further analyses and interpretations, we use biomaRt to convert the ids to gene names. Eventually, we combine the collected gene info with the results of the differential analysis and export them in a csv file (see also Table 4). 
+
+```{r promoter_overlaps_load, include=F, class.source = 'fold-hide'}
+library(rGREAT)
+library(biomaRt)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+```
+
+```{r promoter_overlaps, class.source = 'fold-hide'}
+
+# load the genome database and extract the transcriptional start sites for all genes
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+suppressMessages(genes_gr <- genes(txdb))
+tss_gr <- promoters(genes_gr, 0,1) 
+
+# define regulatory domains for each gene
+etss <- extendTSS(tss_gr, genome = "hg38", gene_id_type = "ENTREZ", basal_upstream = 5000, basal_downstream = 1000, extension = 1000000) 
+# find overlaps of the differential peaks with regulatory domains of genes
+basal_ext <- findOverlaps(tamoxifen.DB, etss, type='any', ignore.strand=TRUE) 
+basal_ext_gr <- tamoxifen.DB[queryHits(basal_ext)] 
+basal_ext_gr$gene_id <- etss[subjectHits(basal_ext)]$gene_id 
+
+# convert entrezgene ids to gene symbols and ensembl gene ids
+tryCatch({
+# Update timeout for downloads
+options(timeout = max(30000, getOption("timeout")))
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "useast")
+res_basal <- getBM(attributes = c('entrezgene_id', 'ensembl_gene_id', 'external_gene_name'),
+      filters = 'entrezgene_id',
+      values = basal_ext_gr$gene_id, 
+      mart = mart)
+
+# merge the gene info with the differential peaks list
+basal_ext_res <- merge(as.data.frame(basal_ext_gr, row.names = NULL), res_basal, by.x="gene_id", by.y="entrezgene_id", all.x=T, all.y=T)
+basal_ext_res <- unique(basal_ext_res)
+
+# save the data in a csv table
+write.csv(basal_ext_res, here("results", "gene_annotations.csv"), row.names = FALSE, quote = FALSE)
+
+#kable(basal_ext_res, caption = 'Overlap of differential peaks with regulatory domains of genes')
+library(DT)
+datatable(basal_ext_res, extensions = c('Buttons'), options = list(dom = 'Bfrtip', buttons = c('csv', 'excel'), autoWidth = TRUE, scrollX = TRUE), caption = htmltools::tags$caption(
+    style = 'caption-side: top; text-align: left;',
+    'Table 4 ', htmltools::em('Overlap of differential peaks with regulatory domains of genes')))
+},
+error = function(e) {
+  str(e) # prints error
+}
+)
+```
+You can extract the gene names from the list and use them as input for pathway enrichment analysis web-tools like 
+[Enrichr](https://maayanlab.cloud/Enrichr/), [DAVID](https://david.ncifcrf.gov/tools.jsp) and [WEBGESTALT](http://www.webgestalt.org) and a myriad of R tools such as [clusterProfiler](https://bioconductor.org/packages/release/bioc/html/clusterProfiler.html) or [topGO](https://bioconductor.org/packages/release/bioc/html/topGO.html). 
+
+## Motif discovery
+
+Moreover, you can perform motif analysis. Therefore, you have to extract the sequences from the differential regions to a fasta file. First load the `BSgenome.Hsapiens.UCSC.hg38` library and extract the subsequences of the genome with `getSeq()`. Then specify the names of the sequences and save the sequences to a fasta file with `writeXStringSet()` from the `Biostrings` package. The sequences are saved to `results/significant_regions.fa`.  
+You can then use the [MEME server](https://meme-suite.org) to find recurring motifs in these sequences.
+
+```{r motif_discoveryload, include=FALSE, class.source = 'fold-hide'}
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r motif_discovery, class.source = 'fold-hide'}
+seq <- getSeq(BSgenome.Hsapiens.UCSC.hg38, tamoxifen.DB)
+names(seq) <- as.character(tamoxifen.DB)
+writeXStringSet(seq, here('results', 'significant_regions.fa'), format = 'fasta')
+```
+
+
+## Visualization in genome browsers
+
+Various ChIP-Seq files can be visualized in a genome browser such as the [integrative genome viewer (IGV)](https://igv.org/app/). For example, you can load the BED files of the individual samples, as well as their consensus peak set BED file in IGV. Furthermore you can depict differences in the ChIP-Seq signal of differential peaks by loading in the bedgraph files from the nf-core chipseq pipeline, which can be found at `results/bwa/mergedLibrary/bigwig`. 
+
+
+# Session Info
+```{r session, collapse=T, class.source = 'fold-hide'}
+sessionInfo()
+```
